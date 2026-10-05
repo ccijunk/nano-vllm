@@ -36,7 +36,7 @@ class KVOrg:
 
 class NanoAttention(nn.Module):
 
-    def __init__(self, config: SidecarConfig) -> None:
+    def __init__(self, config: SidecarConfig, pool_idx: int = 0, window: int = 0) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
         self.total_num_heads = config.num_attention_heads
@@ -66,7 +66,8 @@ class NanoAttention(nn.Module):
             max_position=config.max_position_embeddings,
             base=config.rope_theta,
         )
-        self.attn = Attention(self.num_heads, self.head_dim, self.scaling, self.num_kv_heads)
+        self.attn = Attention(self.num_heads, self.head_dim, self.scaling, self.num_kv_heads,
+                              pool_idx=pool_idx, window=window)
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
@@ -100,9 +101,9 @@ class NanoMLP(nn.Module):
 
 class NanoDecoderLayer(nn.Module):
 
-    def __init__(self, config: SidecarConfig) -> None:
+    def __init__(self, config: SidecarConfig, pool_idx: int = 0, window: int = 0) -> None:
         super().__init__()
-        self.self_attn = NanoAttention(config)
+        self.self_attn = NanoAttention(config, pool_idx=pool_idx, window=window)
         self.mlp = NanoMLP(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -127,8 +128,14 @@ class NanoModel(nn.Module):
 
     def __init__(self, config: SidecarConfig) -> None:
         super().__init__()
+        # T3d 层→池映射（design §1）：sliding_window_layers 中的层 = pool 1（SWA），其余 = pool 0
+        swa_layers = set(config.sliding_window_layers or ())
+        window = config.sliding_window or 0
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList(NanoDecoderLayer(config) for _ in range(config.num_hidden_layers))
+        self.layers = nn.ModuleList(
+            NanoDecoderLayer(config, pool_idx=1 if i in swa_layers else 0, window=window if i in swa_layers else 0)
+            for i in range(config.num_hidden_layers)
+        )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -157,6 +164,18 @@ class NanoForCausalLM(nn.Module):
 
     def __init__(self, config: SidecarConfig) -> None:
         super().__init__()
+        # T3d（design §1）：层→池映射由侧车 config 决定 kv_org 声明——有 SWA 层 = 双池
+        swa_layers = config.sliding_window_layers or ()
+        if swa_layers:
+            assert config.sliding_window and config.sliding_window > 0, "sliding_window_layers 需配 sliding_window"
+            assert max(swa_layers) < config.num_hidden_layers, f"SWA 层号越界: {max(swa_layers)}"
+            self.kv_org = KVOrg(
+                pools=2,
+                per_token_bytes=lambda cfg: 2 * cfg.num_key_value_heads * cfg.head_dim * cfg.dtype.itemsize,
+                layout="paged_kt_vt|paged_kt_vt_swa",
+            )
+        else:
+            self.kv_org = type(self).kv_org  # 单池默认（类属性）
         self.model = NanoModel(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:

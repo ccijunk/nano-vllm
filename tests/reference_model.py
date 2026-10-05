@@ -42,8 +42,13 @@ def rope(x: torch.Tensor, theta: float) -> torch.Tensor:
 
 
 @torch.no_grad()
-def forward(weights: dict[str, torch.Tensor], ids: list[int], cfg: dict) -> torch.Tensor:
-    """返回末位 logits（fp32，[vocab_size]）。weights = C1 fp32 master，cfg = C1 侧车字段。"""
+def forward(weights: dict[str, torch.Tensor], ids: list[int], cfg: dict,
+            swa_layers=frozenset(), window: int = 0) -> torch.Tensor:
+    """返回末位 logits（fp32，[vocab_size]）。weights = C1 fp32 master，cfg = C1 侧车字段。
+
+    swa_layers/window（T3d E-D3）：窗口掩码 key 位置 s 满足 t - s ≤ window - 1
+    （与 flash-attn window_size=(W-1, 0) 同义；非 SWA 层不受影响）。
+    """
     W = weights
     L, H, KVH, D = cfg["n_layers"], cfg["n_heads"], cfg["n_kv_heads"], cfg["head_dim"]
     eps, theta = cfg["rms_norm_eps"], cfg["rope_theta"]
@@ -69,6 +74,9 @@ def forward(weights: dict[str, torch.Tensor], ids: list[int], cfg: dict) -> torc
         v = v.repeat_interleave(group, dim=1)
         scores = torch.einsum("thd,shd->hts", q, k) * scale          # [H, T, T]
         mask = torch.triu(torch.ones(T, T, dtype=torch.bool), 1)
+        if i in swa_layers:
+            t_idx = torch.arange(T)
+            mask = mask | (t_idx[None, :] < t_idx[:, None] - (window - 1))
         o = torch.softmax(scores.masked_fill(mask, float("-inf")), -1) @ v.transpose(0, 1)
         x = o.transpose(0, 1).reshape(T, H * D) @ W[p + "self_attn.o_proj.weight"].float().T
         residual = residual + x

@@ -19,6 +19,9 @@ class ModelRunner:
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
+        # T3d：SWA 两池形态开关（侧车 config 自报，doc/topics/t3d_swa_multipool.md §1）
+        self.has_swa = bool(hf_config.sliding_window_layers)
+        self.window = (hf_config.sliding_window or 0) if self.has_swa else 0
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
@@ -109,20 +112,48 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
-        layer_id = 0
+        n_swa = len(hf_config.sliding_window_layers or ())
+        n_full = hf_config.num_hidden_layers - n_swa
+        per_layer_bytes = 2 * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        avail = int(total * config.gpu_memory_utilization - used - peak + current)
+        if self.has_swa:
+            # T3d 决策④：SWA 池按确定性公式先扣，余额归全池（E-D2 机器断言）
+            config.num_kvcache_blocks_swa = config.max_num_seqs * (self.window // self.block_size + 2)
+            swa_bytes = config.num_kvcache_blocks_swa * n_swa * per_layer_bytes
+            config.num_kvcache_blocks = (avail - swa_bytes) // (n_full * per_layer_bytes)
+            assert config.num_kvcache_blocks > 0
+            self.kv_cache = torch.empty(2, n_full, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+            self.kv_cache_swa = torch.empty(2, n_swa, config.num_kvcache_blocks_swa, self.block_size, num_kv_heads, head_dim)
+        else:
+            config.num_kvcache_blocks = avail // (hf_config.num_hidden_layers * per_layer_bytes)
+            assert config.num_kvcache_blocks > 0
+            self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        # 层挂载：按 pool_idx 从对应池取视图（各池按自己的层序号递增）
+        layer_id = swa_layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
-                layer_id += 1
+                if module.pool_idx == 1:
+                    module.k_cache = self.kv_cache_swa[0, swa_layer_id]
+                    module.v_cache = self.kv_cache_swa[1, swa_layer_id]
+                    swa_layer_id += 1
+                else:
+                    module.k_cache = self.kv_cache[0, layer_id]
+                    module.v_cache = self.kv_cache[1, layer_id]
+                    layer_id += 1
+        assert layer_id == n_full and swa_layer_id == n_swa
+        # kv_org 一致性断言（design §1）：pools==2 ⟺ 侧车窗口字段齐备且列表非空
+        assert self.model.kv_org.pools == (2 if self.has_swa else 1), self.model.kv_org.pools
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
+        block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        return block_tables
+
+    def prepare_block_tables_swa(self, seqs: list[Sequence]):
+        """T3d：窗口裁剪后的 SWA 块表（长度上限 = ceil(W/bs)+1，E-D2）。"""
+        max_len = max(len(seq.swa_block_table) for seq in seqs)
+        block_tables = [seq.swa_block_table + [-1] * (max_len - len(seq.swa_block_table)) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
@@ -134,6 +165,7 @@ class ModelRunner:
         max_seqlen_q = 0
         max_seqlen_k = 0
         slot_mapping = []
+        slot_mapping_swa = []
         block_tables = None
         for seq in seqs:
             start = seq.num_cached_tokens
@@ -159,6 +191,18 @@ class ModelRunner:
                 else:
                     slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
                 slot_mapping.extend(range(slot_start, slot_end))
+            if self.has_swa:
+                # T3d：SWA 层窗口键必须全在本次计算内（design §2.3）——prefix cache 已被
+                # BlockManager 决策②扩展禁用，此处唯一残留来源是 chunked prefill，显式拒绝
+                assert start == 0, "T3d scope: SWA 模型不支持 chunked prefill"
+                table_start = seq.swa_table_start
+                for t in range(start, end):
+                    if t < table_start:    # 窗口外键：不入 SWA 池（flash window_size 屏蔽）
+                        slot_mapping_swa.append(-1)
+                    else:
+                        off = t - table_start
+                        slot_mapping_swa.append(
+                            seq.swa_block_table[off // self.block_size] * self.block_size + off % self.block_size)
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -166,7 +210,12 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        if self.has_swa:
+            slot_mapping_swa = torch.tensor(slot_mapping_swa, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        else:
+            slot_mapping_swa = None
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables,
+                    slot_mapping_swa=slot_mapping_swa)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -174,17 +223,31 @@ class ModelRunner:
         positions = []
         slot_mapping = []
         context_lens = []
+        slot_mapping_swa = []
+        context_lens_swa = []
         for seq in seqs:
             input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+            if self.has_swa:
+                # T3d：SWA 槽位/可见长度相对窗口裁剪表（cache_seqlens = L - window_start）
+                off = seq.num_tokens - 1 - seq.swa_table_start
+                slot_mapping_swa.append(
+                    seq.swa_block_table[off // self.block_size] * self.block_size + off % self.block_size)
+                context_lens_swa.append(seq.num_tokens - seq.swa_table_start)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        if self.has_swa:
+            set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables,
+                        slot_mapping_swa=torch.tensor(slot_mapping_swa, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+                        context_lens_swa=torch.tensor(context_lens_swa, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+                        block_tables_swa=self.prepare_block_tables_swa(seqs))
+        else:
+            set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -210,6 +273,10 @@ class ModelRunner:
             graph_vars["context_lens"].zero_()
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+            if context.slot_mapping_swa is not None:    # T3d：SWA 三变量同步进图（pools=1 恒 None）
+                graph_vars["slot_mapping_swa"][:bs] = context.slot_mapping_swa
+                graph_vars["context_lens_swa"][:bs] = context.context_lens_swa
+                graph_vars["block_tables_swa"][:bs, :context.block_tables_swa.size(1)] = context.block_tables_swa
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
@@ -227,11 +294,16 @@ class ModelRunner:
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        # T3d：SWA 表宽上限 = ceil(W/bs)+1（窗口起点块对齐 → 可见长度 ≤ W+bs-1）；pools=1 最小占位
+        max_swa_blocks = (self.window - 1) // self.block_size + 2 if self.has_swa else 1
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
+        slot_mapping_swa = torch.zeros(max_bs, dtype=torch.int32)
+        context_lens_swa = torch.zeros(max_bs, dtype=torch.int32)
+        block_tables_swa = torch.zeros(max_bs, max_swa_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
@@ -239,7 +311,8 @@ class ModelRunner:
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs],
+                        slot_mapping_swa=slot_mapping_swa[:bs], context_lens_swa=context_lens_swa[:bs], block_tables_swa=block_tables_swa[:bs])
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
             with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
@@ -255,5 +328,8 @@ class ModelRunner:
             slot_mapping=slot_mapping,
             context_lens=context_lens,
             block_tables=block_tables,
+            slot_mapping_swa=slot_mapping_swa,
+            context_lens_swa=context_lens_swa,
+            block_tables_swa=block_tables_swa,
             outputs=outputs,
         )

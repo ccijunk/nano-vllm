@@ -25,7 +25,9 @@ class Sequence:
         self.num_cached_tokens = 0
         self.num_scheduled_tokens = 0
         self.is_prefill = True
-        self.block_table = []
+        self.block_table = []           # pool 0（全池）：prefix cache 语义（T3d 决策⑤）
+        self.swa_block_table = []       # pool 1（SWA 池）：窗口裁剪后的可见块表；单池恒空
+        self.swa_table_start = 0        # 表首块绝对 token 位（块对齐，BlockManager 维护）
         self.temperature = sampling_params.temperature
         self.top_p = sampling_params.top_p
         self.max_tokens = sampling_params.max_tokens
@@ -65,6 +67,19 @@ class Sequence:
         assert 0 <= i < self.num_blocks
         return self.token_ids[i*self.block_size: (i+1)*self.block_size]
 
+    # ---- T3d SWA 窗口数学（BlockManager / ModelRunner 三处共享，单一事实源）----
+    # 可见窗口 = [window_start, L)；窗口起始按块对齐向下取整（design §2.1）
+
+    def swa_window_start(self, window: int) -> int:
+        if self.num_tokens <= window:
+            return 0
+        bs = self.block_size
+        return (self.num_tokens - window) // bs * bs
+
+    def swa_num_blocks(self, window: int) -> int:
+        start = self.swa_window_start(window)
+        return (self.num_tokens - start + self.block_size - 1) // self.block_size
+
     def append_token(self, token_id: int):
         self.token_ids.append(token_id)
         self.last_token = token_id
@@ -72,10 +87,10 @@ class Sequence:
 
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state)
+        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, self.swa_block_table, self.swa_table_start, last_state)
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state = state
+        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, self.swa_block_table, self.swa_table_start, last_state = state
         if isinstance(last_state, list):
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]

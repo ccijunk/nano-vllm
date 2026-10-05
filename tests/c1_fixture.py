@@ -54,15 +54,22 @@ def gen_weights() -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     return fp32, bf16
 
 
-def write_model_dir(target: str) -> str:
-    """落盘 C1 侧车目录（幂等：模型文件已存在则跳过——确定性 seed 下重生成结果恒等）。"""
+def write_model_dir(target: str, swa: dict | None = None) -> str:
+    """落盘 C1 侧车目录（幂等：模型文件已存在则跳过——确定性 seed 下重生成结果恒等）。
+
+    swa（T3d 测试模型，design §2.4）：{"sliding_window": W, "sliding_window_layers": [...]}
+    → 写入 config.json；权重与单池 fixture 完全同构（GQA 结构不变，引擎 config-driven 分派）。
+    """
     if os.path.exists(os.path.join(target, MODEL_FILE)):
         return target
     os.makedirs(target, exist_ok=True)
     _, bf16 = gen_weights()
     save_file(bf16, os.path.join(target, MODEL_FILE))
+    cfg = dict(CFG)
+    if swa:
+        cfg.update(swa)
     with open(os.path.join(target, "config.json"), "w") as f:
-        json.dump(CFG, f)
+        json.dump(cfg, f)
     # vocab.json = {"itos": [...]}（与 nano-model CharTokenizer 同构）；42 个可打印 ASCII
     with open(os.path.join(target, "vocab.json"), "w") as f:
         json.dump({"itos": [chr(33 + i) for i in range(CFG["vocab_size"])]}, f)

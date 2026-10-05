@@ -12,7 +12,14 @@ class Scheduler:
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
-        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        # T3d：num_kvcache_blocks(_swa) 已由 ModelRunner.allocate_kv_cache 填定
+        #（构造顺序：LLMEngine 先 runner 后 scheduler，config 为共享对象）
+        hf = config.hf_config
+        window = (hf.sliding_window or 0) if hf.sliding_window_layers else 0
+        self.block_manager = BlockManager(
+            config.num_kvcache_blocks, config.kvcache_block_size,
+            config.num_kvcache_blocks_swa if window else 0, window,
+        )
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
 

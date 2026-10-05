@@ -41,6 +41,8 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
 
 
 class Attention(nn.Module):
+    """pool_idx/window（T3d）：pool 0 = 全池（现状路径）；pool 1 = SWA 池
+    （prefill 用 flash 原生 window_size 掩窗、decode 用窗口裁剪表）。"""
 
     def __init__(
         self,
@@ -48,28 +50,41 @@ class Attention(nn.Module):
         head_dim,
         scale,
         num_kv_heads,
+        pool_idx: int = 0,
+        window: int = 0,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.scale = scale
         self.num_kv_heads = num_kv_heads
+        self.pool_idx = pool_idx
+        self.window = window  # >0 = SWA 层，可见窗口 = window 个 token
         self.k_cache = self.v_cache = torch.tensor([])
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
+        is_swa = self.pool_idx == 1
         if k_cache.numel() and v_cache.numel():
-            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+            slot_mapping = context.slot_mapping_swa if is_swa else context.slot_mapping
+            store_kvcache(k, v, k_cache, v_cache, slot_mapping)
         if context.is_prefill:
-            if context.block_tables is not None:    # prefix cache
+            if not is_swa and context.block_tables is not None:    # prefix cache（全池专属，决策②）
                 k, v = k_cache, v_cache
             o = flash_attn_varlen_func(q, k, v,
                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                                       softmax_scale=self.scale, causal=True, block_table=context.block_tables)
+                                       softmax_scale=self.scale, causal=True, block_table=context.block_tables if not is_swa else None,
+                                       window_size=(self.window - 1, 0) if is_swa else (-1, -1))
         else:    # decode
-            o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                        cache_seqlens=context.context_lens, block_table=context.block_tables, 
-                                        softmax_scale=self.scale, causal=True)
+            if is_swa:
+                o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
+                                            cache_seqlens=context.context_lens_swa, block_table=context.block_tables_swa,
+                                            softmax_scale=self.scale, causal=True,
+                                            window_size=(self.window - 1, 0))
+            else:
+                o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
+                                            cache_seqlens=context.context_lens, block_table=context.block_tables,
+                                            softmax_scale=self.scale, causal=True)
         return o
