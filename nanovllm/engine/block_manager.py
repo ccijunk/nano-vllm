@@ -3,6 +3,7 @@ import xxhash
 import numpy as np
 
 from nanovllm.engine.sequence import Sequence
+from nanovllm.kv_offload import KVOffloadTier
 
 
 class Block:
@@ -25,8 +26,9 @@ class Block:
 
 class BlockManager:
 
-    def __init__(self, num_blocks: int, block_size: int):
+    def __init__(self, num_blocks: int, block_size: int, tier: KVOffloadTier | None = None):
         self.block_size = block_size
+        self.tier = tier  # offline KV 接缝（接口先行）：None = 现状，零行为变化
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))

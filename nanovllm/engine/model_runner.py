@@ -6,7 +6,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
-from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.nano_model import NanoForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -28,7 +28,7 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        self.model = NanoForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
@@ -190,7 +190,9 @@ class ModelRunner:
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = [seq.temperature for seq in seqs]
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
-        return temperatures
+        top_ps = [seq.top_p for seq in seqs]
+        top_ps = torch.tensor(top_ps, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
+        return temperatures, top_ps
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
@@ -213,9 +215,9 @@ class ModelRunner:
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        temperatures, top_ps = self.prepare_sample(seqs) if self.rank == 0 else (None, None)
         logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        token_ids = self.sampler(logits, temperatures, top_ps).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
 

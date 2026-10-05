@@ -2,10 +2,10 @@ import atexit
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer
 import torch.multiprocessing as mp
 
 from nanovllm.config import Config
+from nanovllm.char_tokenizer import CharTokenizer
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
@@ -18,6 +18,7 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        self.config = config  # server 层只读视图（max_position 等校验用）
         Sequence.block_size = config.kvcache_block_size
         self.ps = []
         self.events = []
@@ -29,14 +30,18 @@ class LLMEngine:
             self.ps.append(process)
             self.events.append(event)
         self.model_runner = ModelRunner(config, 0, self.events)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
-        config.eos = self.tokenizer.eos_token_id
+        self.tokenizer = CharTokenizer.from_pretrained(config.model)
+        # char 模型无 EOS：eos=-1 使 token_id 永不匹配，finish_reason 仅由 max_tokens 触发
+        config.eos = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else -1
         self.scheduler = Scheduler(config)
         atexit.register(self.exit)
 
     def exit(self):
+        # 幂等：server/pytest 生命周期需显式 teardown，atexit 会二次触发
+        if self.model_runner is None:
+            return
         self.model_runner.call("exit")
-        del self.model_runner
+        self.model_runner = None
         for p in self.ps:
             p.join()
 
