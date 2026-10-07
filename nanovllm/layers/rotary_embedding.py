@@ -34,7 +34,8 @@ class RotaryEmbedding(nn.Module):
         cache = torch.cat((cos, sin), dim=-1).unsqueeze_(1)
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
-    @torch.compile
+    # dynamic=True: token dim varies per continuous-batching step (see layernorm.py)
+    @torch.compile(dynamic=True)
     def forward(
         self,
         positions: torch.Tensor,

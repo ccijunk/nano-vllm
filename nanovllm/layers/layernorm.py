@@ -1,6 +1,11 @@
 import torch
 from torch import nn
 
+# dynamic=True: continuous batching varies the token dim every step — a plain
+# @torch.compile recompiles per shape (inductor 20-worker storm ×4 pods, host
+# load 308; T6 finding, platform/012). enforce_eager only gates CUDA graphs
+# (model_runner) and cannot reach these decorators.
+
 
 class RMSNorm(nn.Module):
 
@@ -13,7 +18,7 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
-    @torch.compile
+    @torch.compile(dynamic=True)
     def rms_forward(
         self,
         x: torch.Tensor,
@@ -25,7 +30,7 @@ class RMSNorm(nn.Module):
         x = x.to(orig_dtype).mul_(self.weight)
         return x
 
-    @torch.compile
+    @torch.compile(dynamic=True)
     def add_rms_forward(
         self,
         x: torch.Tensor,
